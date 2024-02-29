@@ -16,7 +16,7 @@ from keras.models import Model
 
 # DESOM components
 from SOM import SOMLayer
-from AE import mlp_autoencoder
+from AE import mlp_autoencoder, lstm_autoencoder
 # from evaluation import PerfLogger
 
 
@@ -520,3 +520,88 @@ class DESOM:
         }
         # perflogger.evaluate(final_summary, verbose=verbose)
         # perflogger.close()
+
+class LstmDESOM(DESOM):
+    """Subclass of DESOM to cluster time series data"""
+    def __init__(self, hidden, input_dim, *args, **kwargs):
+        """
+        Parameters
+        ---
+        hidden: int
+            number of hidden units in lstm layers
+        features: int
+            number of input and output features in data
+        input_dim: list:int
+            (T, N) dimensions of input data
+        """
+        super().__init__(*args, **kwargs)
+        self.n_latent = hidden
+        self.input_dim = input_dim
+        self.features = input_dim[-1]
+        self.timesteps = input_dim[0]
+    def initialize(self, ae_act='relu', ae_init='glorot_uniform', batchnorm=False):
+        """Initialize DESOM model
+
+        Parameters
+        ----------
+        ae_act : str (default='relu')
+            activation for AE intermediate layers
+        ae_init : str (default='glorot_uniform')
+            initialization of AE layers
+        batchnorm : bool (default=False)
+            use batch normalization
+        """
+        # Create AE models
+        self.autoencoder, self.encoder, self.decoder = lstm_autoencoder(input_dim = self.input_dim, n_latent = self.n_latent, activation = ReLU(max_value = 2.0))
+        som_layer = SOMLayer(self.map_size, name='SOM')(self.encoder.output)
+        # Create DESOM model
+        self.model = Model(inputs=self.autoencoder.input,
+                           outputs=[self.autoencoder.output, som_layer])
+    def decode(self, z, initial_state):
+        """Decoding function. Decodes encoded features from latent space
+
+        Parameters
+        ----------
+        z : array, shape = [n_samples, n_timesteps, latent_dim]
+            sequence of encoded (latent) samples
+        initial_state: list[array, array]
+            initial hidden and final cell state from encoder
+
+        Returns
+        -------
+        x : array, shape = [n_samples, input_dim] or [n_samples, height, width, channels]
+            decoded samples
+        """
+        return self.decoder.predict([z, initial_state])
+    
+    def pretrain(self,
+                 X,
+                 optimizer='adam',
+                 epochs=200,
+                 batch_size=256,
+                 save_dir='results/tmp'):
+        """Pre-train the autoencoder using only MSE reconstruction loss. Saves weights in h5 format
+
+        Parameters
+        ----------
+        X : array, shape = [n_samples, n_timesteps, n_features] 
+            training set
+        optimizer : str (default='adam')
+            optimization algorithm
+        epochs : int (default=200)
+            number of pre-training epochs
+        batch_size : int (default=256)
+            training batch size
+        save_dir : str (default='results/tmp')
+            path to existing directory where weights will be saved
+        """
+        print('Pretraining...')
+        self.autoencoder.compile(optimizer=optimizer, loss='mse')
+        X_rev = np.flip(X, axis = 1) # create a reverse-time copy of input data
+        # Begin pretraining
+        t0 = time()
+        self.autoencoder.fit(X, X_rev, batch_size=batch_size, epochs=epochs)
+        print('Pretraining time: ', time() - t0)
+        self.autoencoder.save_weights('{}/ae_weights-epoch{}.h5'.format(save_dir, epochs))
+        print('Pretrained weights are saved to {}/ae_weights-epoch{}.h5'.format(save_dir, epochs))
+        self.pretrained = True
