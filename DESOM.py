@@ -13,6 +13,7 @@ import numpy as np
 # Tensorflow/Keras
 import tensorflow as tf
 from keras.models import Model
+from keras.layers import ReLU
 
 # DESOM components
 from SOM import SOMLayer
