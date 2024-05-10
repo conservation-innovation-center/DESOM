@@ -7,7 +7,7 @@ Autoencoder helper functions
 """
 
 from keras.models import Model
-from keras.layers import Activation, BatchNormalization, Input, Dense, Conv2D, MaxPooling2D, UpSampling2D, Flatten, Reshape, BatchNormalization, LSTM
+from keras.layers import ReLU, Activation, BatchNormalization, Input, Dense, Conv2D, MaxPooling2D, UpSampling2D, Flatten, Reshape, BatchNormalization, LSTM
 import numpy as np
 from random import uniform
 

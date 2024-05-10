@@ -99,8 +99,7 @@ class DESOM:
         """
         # Create AE models
         self.autoencoder, self.encoder, self.decoder = mlp_autoencoder(self.encoder_dims, ae_act, ae_init, batchnorm)
-        som_layer = SOMLayer(self.map_size, name='SOM')(self.encoder.output)
-        # Create DESOM model
+        som_layer = SOMLayer(self.map_size, name='SOM')(self.encoder.output) 
         self.model = Model(inputs=self.autoencoder.input,
                            outputs=[self.autoencoder.output, som_layer])
     
@@ -439,7 +438,7 @@ class DESOM:
             if ite % eval_interval == 0:
 
                 # Get SOM weights and decode to original space
-                decoded_prototypes = self.decode(self.prototypes)
+                decoded_prototypes = self.decode(self.prototypes) # prototypes are the SOM weights
                 decoded_prototypes = decoded_prototypes.reshape(decoded_prototypes.shape[0], -1)
                 # Compute pairwise squared euclidean distance matrix in original space
                 d_original = np.square((np.expand_dims(X_batch.reshape(X_batch.shape[0], -1), axis=1)
@@ -554,7 +553,7 @@ class LstmDESOM(DESOM):
         """
         # Create AE models
         self.autoencoder, self.encoder, self.decoder = lstm_autoencoder(input_dim = self.input_dim, n_latent = self.n_latent, activation = ReLU(max_value = 2.0))
-        som_layer = SOMLayer(self.map_size, name='SOM')(self.encoder.output)
+        som_layer = SOMLayer(self.map_size, name='SOM')(self.encoder.output[1]) # feed final hidden state to SOM
         # Create DESOM model
         self.model = Model(inputs=self.autoencoder.input,
                            outputs=[self.autoencoder.output, som_layer])
@@ -606,3 +605,213 @@ class LstmDESOM(DESOM):
         self.autoencoder.save_weights('{}/ae_weights-epoch{}.h5'.format(save_dir, epochs))
         print('Pretrained weights are saved to {}/ae_weights-epoch{}.h5'.format(save_dir, epochs))
         self.pretrained = True
+
+    def fit(self,
+            X_train,
+            y_train=None,
+            X_val=None,
+            y_val=None,
+            iterations=10000,
+            update_interval=1,
+            eval_interval=10,
+            save_epochs=5,
+            batch_size=256,
+            Tmax=10,
+            Tmin=0.1,
+            decay='exponential',
+            neighborhood='gaussian',
+            save_dir='results/tmp',
+            verbose=1):
+        """Training procedure
+
+        Parameters
+        ----------
+        X_train : array, shape = [n_samples, input_dim] or [n_samples, height, width, channels]
+            training set
+        y_train : array, shape = [n_samples]
+            (optional) training labels
+        X_val : array, shape = [n_samples, input_dim] or [n_samples, height, width, channels]
+            (optional) validation set
+        y_val : array, shape = [n_samples]
+            (optional) validation labels
+        iterations : int (default=10000)
+            number of training iterations
+        update_interval : int (default=1)
+            train SOM every update_interval iterations
+        eval_interval : int (default=10)
+            evaluate metrics on training/validation batch every eval_interval iterations
+        save_epochs : int (default=5)
+            save model weights every save_epochs epochs
+        batch_size : int (default=256)
+            training batch size
+        Tmax : float (default=10.0)
+            initial temperature parameter (neighborhood radius)
+        Tmin : float (default=0.1)
+            final temperature parameter (neighborhood radius)
+        decay : str (default='exponential')
+            type of temperature decay ('exponential', 'linear' or 'constant')
+        neighborhood : str (default='gaussian')
+            type of neighborhood function ('gaussian' or 'window')
+        save_dir : str (default='results/tmp'
+            path to existing directory where weights and logs are saved
+        verbose : int (default=1)
+            verbosity level (0, 1 or 2)
+        """
+        if not self.pretrained:
+            print('Autoencoder was not pre-trained!')
+
+        save_interval = X_train.shape[0] // batch_size * save_epochs  # save every save_epochs epochs
+        print('Save interval:', save_interval)
+
+        # Initialize perf logging
+        # perflogger = PerfLogger(with_validation=(X_val is not None),
+        #                         with_labels=(y_train is not None),
+        #                         with_latent_metrics=True,
+        #                         save_dir=save_dir)
+
+        # Initialize batch generator
+        batch = self.batch_generator(X_train, y_train, X_val, y_val, batch_size)
+
+        # Training loop
+        for ite in range(iterations):
+            (X_batch, y_batch), (X_val_batch, y_val_batch) = next(batch)
+
+            # Train AE and SOM jointly
+            if ite % update_interval == 0:
+                # Compute cluster assignments for batch
+                _, d = self.model.predict(X_batch)
+                y_pred = d.argmin(axis=1)
+                if X_val is not None:
+                    _, d_val = self.model.predict(X_val_batch)
+                    y_val_pred = d_val.argmin(axis=1)
+
+                # Update temperature parameter
+                if decay == 'exponential':
+                    T = Tmax * (Tmin / Tmax)**(ite / (iterations - 1))
+                elif decay == 'linear':
+                    T = Tmax - (Tmax - Tmin)*(ite / (iterations - 1))
+                elif decay == 'constant':
+                    T = Tmax
+                else:
+                    raise ValueError('invalid decay function')
+
+                # Compute topographic weights batches
+                w_batch = self.neighborhood_function(self.map_dist(y_pred), T, neighborhood)
+                if X_val is not None:
+                    w_val_batch = self.neighborhood_function(self.map_dist(y_val_pred), T, neighborhood)
+
+                # Train on batch
+                loss = self.model.train_on_batch(X_batch, [X_batch, w_batch])
+
+            # Train only AE
+            else:
+                loss = self.model.train_on_batch(X_batch, [X_batch, np.zeros((X_batch.shape[0], self.n_prototypes))])
+
+            # Evaluate and log monitored metrics
+            if ite % eval_interval == 0:
+
+                # Get SOM weights and decode to original space
+                # TODO: This is less straightforward with an lstm model
+                # decoded_prototypes = self.decode(self.prototypes, initial_state = [decoder_hidden, decoder_cell])
+                # decoded_prototypes = decoded_prototypes.reshape(decoded_prototypes.shape[0], -1)
+               
+                # Compute pairwise squared euclidean distance matrix in original space
+                # d_original = np.square((np.expand_dims(X_batch.reshape(X_batch.shape[0], -1), axis=1)
+                #                         - decoded_prototypes)).sum(axis=2)
+                # Compute pairwise squared euclidean distance matrix in original space
+                
+                # TODO: instead lets encode the batch and get euclidean distance
+                # with current weights
+                _, encoded_hidden, _ = self.encode(X_batch)
+                reshaped_prototypes = self.prototypes.reshape(self.prototypes.shape[0], -1)
+                d_original = np.square((np.expand_dims(encoded_hidden.reshape(encoded_hidden.shape[0], -1), axis=1)
+                                        - reshaped_prototypes)).sum(axis=2)
+                if X_val is not None:
+                    _, encoded_hidden, _ = self.encode(X_val_batch)
+                    val_loss = self.model.test_on_batch(X_val_batch, [X_val_batch, w_val_batch])
+                    d_original_val = np.square((np.expand_dims(encoded_hidden.reshape(encoded_hidden.shape[0], -1), axis=1)
+                                                - reshaped_prototypes)).sum(axis=2)
+
+                batch_summary = {
+                    'map_size': self.map_size,
+                    'iteration': ite,
+                    'T': T,
+                    'loss': loss,
+                    'val_loss': val_loss if X_val is not None else None,
+                    'd_latent': np.sqrt(d),
+                    'd_original': np.sqrt(d_original),
+                    'd_latent_val': np.sqrt(d_val) if X_val is not None else None,
+                    'd_original_val': np.sqrt(d_original_val) if X_val is not None else None,
+                    'prototypes': self.prototypes, #decoded_prototypes,
+                    'latent_prototypes': self.prototypes,
+                    'X': X_batch.reshape(X_batch.shape[0], -1),
+                    'X_val': X_val_batch.reshape(X_val_batch.shape[0], -1) if X_val is not None else None,
+                    'Z': self.encode(X_batch),
+                    'Z_val': self.encode(X_val_batch) if X_val is not None else None,
+                    'y_true': y_batch,
+                    'y_pred': y_pred,
+                    'y_val_true': y_val_batch,
+                    'y_val_pred': y_val_pred if X_val is not None else None,
+                }
+
+                # perflogger.log(batch_summary, verbose=verbose)
+
+            # Save intermediate model
+            if ite % save_interval == 0:
+                self.model.save_weights(save_dir + '/DESOM_model_' + str(ite) + '.h5')
+                print('Saved model to:', save_dir + '/DESOM_model_' + str(ite) + '.h5')
+
+        # Save the final model
+        print('Saving final model to:', save_dir + '/DESOM_model_final.h5')
+        self.model.save_weights(save_dir + '/DESOM_model_final.h5')
+
+        # Evaluate model on entire dataset
+        print('Evaluate model on training and/or validation datasets')
+
+        _, d = self.model.predict(X_train)
+        y_pred = d.argmin(axis=1)
+        if X_val is not None:
+            _, d_val = self.model.predict(X_val)
+            y_val_pred = d_val.argmin(axis=1)
+
+        # Get SOM weights and decode to original space
+        # decoded_prototypes = self.decode(self.prototypes)
+        # decoded_prototypes = decoded_prototypes.reshape(decoded_prototypes.shape[0], -1)
+        # Compute pairwise squared euclidean distance matrix in original space
+        # d_original = np.square((np.expand_dims(X_train.reshape(X_train.shape[0], -1), axis=1)
+        #                         - decoded_prototypes)).sum(axis=2)
+        
+        _, encoded_hidden, _ = self.encode(X_batch)
+        reshaped_prototypes = self.prototypes.reshape(self.prototypes.shape[0], -1)
+        d_original = np.square((np.expand_dims(encoded_hidden.reshape(encoded_hidden.shape[0], -1), axis=1)
+                                - reshaped_prototypes)).sum(axis=2)
+        
+        if X_val is not None:
+            _, encoded_hidden, _ = self.encode(X_val_batch)
+            val_loss = self.model.test_on_batch(X_val_batch, [X_val_batch, w_val_batch])
+            d_original_val = np.square((np.expand_dims(encoded_hidden.reshape(encoded_hidden.shape[0], -1), axis=1)
+                                        - reshaped_prototypes)).sum(axis=2)
+
+            # d_original_val = np.square((np.expand_dims(X_val.reshape(X_val.shape[0], -1), axis=1)
+            #                             - decoded_prototypes)).sum(axis=2)
+
+        final_summary = {
+            'map_size': self.map_size,
+            'iteration': iterations,
+            'd_latent': np.sqrt(d),
+            'd_original': np.sqrt(d_original),
+            'd_latent_val': np.sqrt(d_val) if X_val is not None else None,
+            'd_original_val': np.sqrt(d_original_val) if X_val is not None else None,
+            'prototypes': self.prototypes,
+            'latent_prototypes': self.prototypes,
+            'X': X_train.reshape(X_train.shape[0], -1),
+            'X_val': X_val.reshape(X_val.shape[0], -1) if X_val is not None else None,
+            'Z': self.encode(X_train),
+            'Z_val': self.encode(X_val) if X_val is not None else None,
+            'y_true': y_train,
+            'y_pred': y_pred,
+            'y_val_true': y_val,
+            'y_val_pred': y_val_pred if X_val is not None else None,
+        }
+        # perflogger.evaluate(final_summary, verbose=verbose)
+        # perflogger.close()
