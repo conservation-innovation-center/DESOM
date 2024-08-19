@@ -345,6 +345,7 @@ class DESOM:
             y_train=None,
             X_val=None,
             y_val=None,
+            start = 0,
             epochs = 100,
             # iterations=10000,
             update_interval=1,
@@ -411,7 +412,7 @@ class DESOM:
         # batch = self.batch_generator(X_train, y_train, X_val, y_val, batch_size)
 
         # Training loop
-        for epoch in range(epochs):
+        for epoch in range(start, epochs):
             train_generator = self.batch_generator(X_train, y_train, batch_size, shuffle = True)
             # val_generator = self.batch_generator(X_val, y_val, shuffle = False)
             for step in range(steps_per_epoch):
