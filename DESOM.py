@@ -626,11 +626,13 @@ class LstmDESOM(DESOM):
             y_train=None,
             X_val=None,
             y_val=None,
-            iterations=10000,
+            start = 0,
+            epochs = 100,
+            # iterations=10000,
             update_interval=1,
-            eval_interval=10,
-            save_epochs=5,
-            batch_size=256,
+            # eval_interval=10,
+            # save_epochs=5,
+            batch_size=12,
             Tmax=10,
             Tmin=0.1,
             decay='exponential',
@@ -675,8 +677,8 @@ class LstmDESOM(DESOM):
         if not self.pretrained:
             print('Autoencoder was not pre-trained!')
 
-        save_interval = X_train.shape[0] // batch_size * save_epochs  # save every save_epochs epochs
-        print('Save interval:', save_interval)
+        # save_interval = X_train.shape[0] // batch_size * save_epochs  # save every save_epochs epochs
+        # print('Save interval:', save_interval)
 
         # Initialize perf logging
         # perflogger = PerfLogger(with_validation=(X_val is not None),
@@ -685,136 +687,130 @@ class LstmDESOM(DESOM):
         #                         save_dir=save_dir)
 
         # Initialize batch generator
-        batch = self.batch_generator(X_train, y_train, X_val, y_val, batch_size)
+        val_loss_current = np.Inf # initialize best loss at infinity
+        steps_per_epoch = int(np.floor(X_train.shape[0] / batch_size)) # number of iterations per epoch
+        iterations = steps_per_epoch * epochs
+        # batch = self.batch_generator(X_train, y_train, X_val, y_val, batch_size)
 
         # Training loop
-        for ite in range(iterations):
-            (X_batch, y_batch), (X_val_batch, y_val_batch) = next(batch)
+        for epoch in range(start, epochs):
+            print(f'Epoch {epoch}')
+            train_generator = self.batch_generator(X_train, y_train, batch_size, shuffle = True)
+            # val_generator = self.batch_generator(X_val, y_val, shuffle = False)
+            for step in range(steps_per_epoch):
+                # (X_batch, y_batch), (X_val_batch, y_val_batch) = next(batch)
+                (train_batch_x, train_batch_y) = next(train_generator)
+                print(train_batch_x.shape)
+                # Train AE and SOM jointly
+                if step % update_interval == 0:
+                    print(f'Updating join AE and SOM')
+                    # Compute cluster assignments for batch
+                    _, d = self.model.predict(train_batch_x, verbose = 0)
+                    y_pred = d.argmin(axis=1)
 
-            # Train AE and SOM jointly
-            if ite % update_interval == 0:
-                # Compute cluster assignments for batch
-                _, d = self.model.predict(X_batch)
-                y_pred = d.argmin(axis=1)
-                if X_val is not None:
-                    _, d_val = self.model.predict(X_val_batch)
-                    y_val_pred = d_val.argmin(axis=1)
+                    # Update temperature parameter
+                    ite = (step+1)*(epoch+1)
+                    if decay == 'exponential':
+                        T = Tmax * (Tmin / Tmax)**(ite / (iterations - 1))
+                    elif decay == 'linear':
+                        T = Tmax - (Tmax - Tmin)*(ite / (iterations - 1))
+                    elif decay == 'constant':
+                        T = Tmax
+                    else:
+                        raise ValueError('invalid decay function')
 
-                # Update temperature parameter
-                if decay == 'exponential':
-                    T = Tmax * (Tmin / Tmax)**(ite / (iterations - 1))
-                elif decay == 'linear':
-                    T = Tmax - (Tmax - Tmin)*(ite / (iterations - 1))
-                elif decay == 'constant':
-                    T = Tmax
+                    # Compute topographic weights batches
+                    w_batch = self.neighborhood_function(self.map_dist(y_pred), T, neighborhood)
+                    
+                    # Train on batch
+                    loss = self.model.train_on_batch(train_batch_x, [train_batch_x, w_batch])
+
+                # Train only AE
                 else:
-                    raise ValueError('invalid decay function')
-
-                # Compute topographic weights batches
-                w_batch = self.neighborhood_function(self.map_dist(y_pred), T, neighborhood)
-                if X_val is not None:
-                    w_val_batch = self.neighborhood_function(self.map_dist(y_val_pred), T, neighborhood)
-
-                # Train on batch
-                loss = self.model.train_on_batch(X_batch, [X_batch, w_batch])
-
-            # Train only AE
-            else:
-                loss = self.model.train_on_batch(X_batch, [X_batch, np.zeros((X_batch.shape[0], self.n_prototypes))])
+                    loss = self.model.train_on_batch(train_batch_x, [train_batch_x, np.zeros((train_batch_x.shape[0], self.n_prototypes))])
 
             # Evaluate and log monitored metrics
-            if ite % eval_interval == 0:
 
-                # Get SOM weights and decode to original space
-                # TODO: This is less straightforward with an lstm model
-                # decoded_prototypes = self.decode(self.prototypes, initial_state = [decoder_hidden, decoder_cell])
-                # decoded_prototypes = decoded_prototypes.reshape(decoded_prototypes.shape[0], -1)
-               
-                # Compute pairwise squared euclidean distance matrix in original space
-                # d_original = np.square((np.expand_dims(X_batch.reshape(X_batch.shape[0], -1), axis=1)
-                #                         - decoded_prototypes)).sum(axis=2)
-                # Compute pairwise squared euclidean distance matrix in original space
-                
-                # TODO: instead lets encode the batch and get euclidean distance
-                # with current weights
-                _, encoded_hidden, _ = self.encode(X_batch)
-                reshaped_prototypes = self.prototypes.reshape(self.prototypes.shape[0], -1)
-                d_original = np.square((np.expand_dims(encoded_hidden.reshape(encoded_hidden.shape[0], -1), axis=1)
+            # Get SOM weights and decode to original space
+            # TODO: This is less straightforward with an lstm model
+            # decoded_prototypes = self.decode(self.prototypes, initial_state = [decoder_hidden, decoder_cell])
+            # decoded_prototypes = decoded_prototypes.reshape(decoded_prototypes.shape[0], -1)
+            
+            # Compute pairwise squared euclidean distance matrix in original space
+            # d_original = np.square((np.expand_dims(X_batch.reshape(X_batch.shape[0], -1), axis=1)
+            #                         - decoded_prototypes)).sum(axis=2)
+            # Compute pairwise squared euclidean distance matrix in original space
+            
+            # TODO: instead lets encode the batch and get euclidean distance
+            # with current weights
+            reshaped_prototypes = self.prototypes.reshape(self.prototypes.shape[0], -1)
+            # d_original = np.square((np.expand_dims(encoded_hidden.reshape(encoded_hidden.shape[0], -1), axis=1)
+            #                         - reshaped_prototypes)).sum(axis=2)
+
+            _, encoded_hidden, _ = self.encode(X_val)
+            _, d_val = self.model.predict(X_val, verbose = 0)
+            y_val_pred = d_val.argmin(axis=1)
+            w_val_batch = self.neighborhood_function(self.map_dist(y_val_pred), T, neighborhood)
+            val_loss = self.model.test_on_batch(X_val, [X_val, w_val_batch])
+            d_original_val = np.square((np.expand_dims(encoded_hidden.reshape(encoded_hidden.shape[0], -1), axis=1)
                                         - reshaped_prototypes)).sum(axis=2)
-                if X_val is not None:
-                    _, encoded_hidden, _ = self.encode(X_val_batch)
-                    val_loss = self.model.test_on_batch(X_val_batch, [X_val_batch, w_val_batch])
-                    d_original_val = np.square((np.expand_dims(encoded_hidden.reshape(encoded_hidden.shape[0], -1), axis=1)
-                                                - reshaped_prototypes)).sum(axis=2)
 
-                batch_summary = {
-                    'map_size': self.map_size,
-                    'iteration': ite,
-                    'T': T,
-                    'loss': loss,
-                    'val_loss': val_loss if X_val is not None else None,
-                    'd_latent': np.sqrt(d),
-                    'd_original': np.sqrt(d_original),
-                    'd_latent_val': np.sqrt(d_val) if X_val is not None else None,
-                    'd_original_val': np.sqrt(d_original_val) if X_val is not None else None,
-                    'prototypes': self.prototypes, #decoded_prototypes,
-                    'latent_prototypes': self.prototypes,
-                    'X': X_batch.reshape(X_batch.shape[0], -1),
-                    'X_val': X_val_batch.reshape(X_val_batch.shape[0], -1) if X_val is not None else None,
-                    'Z': self.encode(X_batch),
-                    'Z_val': self.encode(X_val_batch) if X_val is not None else None,
-                    'y_true': y_batch,
-                    'y_pred': y_pred,
-                    'y_val_true': y_val_batch,
-                    'y_val_pred': y_val_pred if X_val is not None else None,
-                }
+            batch_summary = {
+                'map_size': self.map_size,
+                'iteration': ite,
+                'T': T,
+                'loss': loss,
+                'val_loss': val_loss if X_val is not None else None,
+                # 'd_latent': np.sqrt(d),
+                # 'd_original': np.sqrt(d_original),
+                'd_latent_val': np.sqrt(d_val) if X_val is not None else None,
+                'd_original_val': np.sqrt(d_original_val) if X_val is not None else None,
+                'prototypes': self.prototypes, #decoded_prototypes,
+                'latent_prototypes': self.prototypes,
+                'X': train_batch_x.reshape(train_batch_x.shape[0], -1),
+                'X_val': X_val.reshape(X_val.shape[0], -1) if X_val is not None else None,
+                'Z': self.encode(train_batch_x),
+                'Z_val': self.encode(X_val) if X_val is not None else None,
+                'y_true': train_batch_y,
+                'y_pred': y_pred,
+                'y_val_true': y_val,
+                'y_val_pred': y_val_pred if X_val is not None else None,
+            }
 
-                # perflogger.log(batch_summary, verbose=verbose)
-
-            # Save intermediate model
-            if ite % save_interval == 0:
-                self.model.save_weights(save_dir + '/DESOM_model_' + str(ite) + '.h5')
-                print('Saved model to:', save_dir + '/DESOM_model_' + str(ite) + '.h5')
-
+            # perflogger.log(batch_summary, verbose=verbose)
+            
+            # Save intermediate model if metric improves
+            if np.array(val_loss).mean() < val_loss_current:
+                val_loss_current = np.array(val_loss).mean()
+                print(val_loss_current)
+                self.model.save_weights(save_dir + '/LstmDESOM_model_' + str(epoch) + '.h5')
+                print('Saved model to:', save_dir + '/LstmDESOM_model_' + str(epoch) + '.h5')
+        
         # Save the final model
-        print('Saving final model to:', save_dir + '/DESOM_model_final.h5')
-        self.model.save_weights(save_dir + '/DESOM_model_final.h5')
+        print('Saving final model to:', save_dir + '/LstmDESOM_model_final.h5')
+        self.model.save_weights(save_dir + '/LstmDESOM_model_final.h5')
 
         # Evaluate model on entire dataset
         print('Evaluate model on training and/or validation datasets')
 
-        _, d = self.model.predict(X_train)
-        y_pred = d.argmin(axis=1)
-        if X_val is not None:
-            _, d_val = self.model.predict(X_val)
-            y_val_pred = d_val.argmin(axis=1)
-
-        # Get SOM weights and decode to original space
-        # decoded_prototypes = self.decode(self.prototypes)
-        # decoded_prototypes = decoded_prototypes.reshape(decoded_prototypes.shape[0], -1)
-        # Compute pairwise squared euclidean distance matrix in original space
-        # d_original = np.square((np.expand_dims(X_train.reshape(X_train.shape[0], -1), axis=1)
-        #                         - decoded_prototypes)).sum(axis=2)
-        
-        _, encoded_hidden, _ = self.encode(X_batch)
         reshaped_prototypes = self.prototypes.reshape(self.prototypes.shape[0], -1)
-        d_original = np.square((np.expand_dims(encoded_hidden.reshape(encoded_hidden.shape[0], -1), axis=1)
-                                - reshaped_prototypes)).sum(axis=2)
-        
-        if X_val is not None:
-            _, encoded_hidden, _ = self.encode(X_val_batch)
-            val_loss = self.model.test_on_batch(X_val_batch, [X_val_batch, w_val_batch])
-            d_original_val = np.square((np.expand_dims(encoded_hidden.reshape(encoded_hidden.shape[0], -1), axis=1)
-                                        - reshaped_prototypes)).sum(axis=2)
+        # d_original = np.square((np.expand_dims(encoded_hidden.reshape(encoded_hidden.shape[0], -1), axis=1)
+        #                         - reshaped_prototypes)).sum(axis=2)
 
-            # d_original_val = np.square((np.expand_dims(X_val.reshape(X_val.shape[0], -1), axis=1)
-            #                             - decoded_prototypes)).sum(axis=2)
-
+        _, encoded_hidden, _ = self.encode(X_val)
+        _, d_val = self.model.predict(X_val, verbose = 0)
+        _, d = self.model.predict(X_train, verbose = 0)
+        y_pred = d.argmin(axis = 1)
+        y_val_pred = d_val.argmin(axis=1)
+        w_val_batch = self.neighborhood_function(self.map_dist(y_val_pred), T, neighborhood)
+        val_loss = self.model.test_on_batch(X_val, [X_val, w_val_batch])
+        d_original_val = np.square((np.expand_dims(encoded_hidden.reshape(encoded_hidden.shape[0], -1), axis=1)
+                                    - reshaped_prototypes)).sum(axis=2)
         final_summary = {
             'map_size': self.map_size,
             'iteration': iterations,
             'd_latent': np.sqrt(d),
-            'd_original': np.sqrt(d_original),
+            # 'd_original': np.sqrt(d_original),
             'd_latent_val': np.sqrt(d_val) if X_val is not None else None,
             'd_original_val': np.sqrt(d_original_val) if X_val is not None else None,
             'prototypes': self.prototypes,
