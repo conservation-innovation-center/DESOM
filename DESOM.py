@@ -612,10 +612,11 @@ class LstmDESOM(DESOM):
         """
         print('Pretraining...')
         self.autoencoder.compile(optimizer=optimizer, loss='mse')
-        X_rev = np.flip(X, axis = 1) # create a reverse-time copy of input data
+        # X_rev = np.flip(X, axis = 1) # create a reverse-time copy of input data
         # Begin pretraining
         t0 = time()
-        self.autoencoder.fit(X, X_rev, batch_size=batch_size, epochs=epochs)
+        self.autoencoder.fit(X, batch_size = batch_size, epochs = epochs)
+        # self.autoencoder.fit(X, X_rev, batch_size=batch_size, epochs=epochs)
         print('Pretraining time: ', time() - t0)
         self.autoencoder.save_weights('{}/ae_weights-epoch{}.h5'.format(save_dir, epochs))
         print('Pretrained weights are saved to {}/ae_weights-epoch{}.h5'.format(save_dir, epochs))
