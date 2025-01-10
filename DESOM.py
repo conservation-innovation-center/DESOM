@@ -587,7 +587,7 @@ class LstmDESOM(DESOM):
         x : array, shape = [n_samples, input_dim] or [n_samples, height, width, channels]
             decoded samples
         """
-        return self.decoder.predict([z, initial_state])
+        return self.decoder.predict([z, initial_state], verbose = 0)
     
     def pretrain(self,
                  X,
@@ -622,8 +622,61 @@ class LstmDESOM(DESOM):
         print('Pretrained weights are saved to {}/ae_weights-epoch{}.h5'.format(save_dir, epochs))
         self.pretrained = True
 
+    def init_som_weights(self, X, init='random'):
+        """Initialize SOM prototype vector
+
+        Parameters
+        ----------
+        X : array, shape = [n_samples, input_dim] or [n_samples, height, width, channels]
+            training set or batch
+        init : str
+            initialize with a sample without remplacement of encoded data points ('random'), or train a standard SOM
+            for one epoch ('som')
+        """
+        if init == 'random':
+            sample = X[np.random.choice(X.shape[0], size=self.n_prototypes, replace=False)]
+            _, encoded_sample, _ = self.encode(sample)
+            self.model.get_layer(name='SOM').set_weights([encoded_sample])
+        elif init == 'som':
+            from minisom import MiniSom
+            Z = self.encode(X)
+            som = MiniSom(self.map_size[0], self.map_size[1], Z.shape[-1],
+                          sigma=min(self.map_size) - 1, learning_rate=0.5)
+            som.train_batch(Z, Z.shape[0])
+            initial_prototypes = som.get_weights().reshape(-1, Z.shape[1])
+            self.model.get_layer(name='SOM').set_weights([initial_prototypes])
+        else:
+            raise ValueError('invalid SOM init mode')
+
+    def evaluate(self, val_generator, T, neighborhood):
+        reshaped_prototypes = self.prototypes.reshape(self.prototypes.shape[0], -1)
+        val_loss = []
+        for X_val, Y_val in val_generator:
+            _, encoded_hidden ,_ = self.encode(X_val)
+            _, d_val = self.model.predict(X_val, verbose = 0)
+            y_val_pred = d_val.argmin(axis=1)
+            w_val_batch = self.neighborhood_function(self.map_dist(y_val_pred), T, neighborhood)
+            val_loss_batch = self.model.test_on_batch(X_val, [Y_val, w_val_batch])
+            d_original_val = np.square((np.expand_dims(encoded_hidden.reshape(encoded_hidden.shape[0], -1), axis=1)
+                                    - reshaped_prototypes)).sum(axis=2)
+            val_loss.append(val_loss_batch)
+            del(_, d_val, y_val_pred, w_val_batch)
+        val_loss_current = np.array(val_loss).mean()
+        return val_loss_current
+    
+    def save_model(self, save_dir, epoch, suffix):
+        if type(save_dir) == ContainerClient:
+            with NamedTemporaryFile(suffix = '.keras') as f:
+                self.model.save_weights(f.name)
+                save_dir.upload_blob(name = f'models/block_lstm/LstmDESOM_{epoch:03d}{suffix}', data = f, overwrite = True)
+        else:
+            self.model.save_weights(f'{save_dir}/LstmDESOM_model_{epoch:03d}{suffix}')
+        print(f'Saved model to: /LstmDESOM_model_{epoch:03d}{suffix}')
+    
     def fit(self,
-            X_train,
+            train_generator,
+            val_generator, 
+            X_train = None,
             y_train=None,
             X_val=None,
             y_val=None,
@@ -687,21 +740,23 @@ class LstmDESOM(DESOM):
         #                         with_latent_metrics=True,
         #                         save_dir=save_dir)
 
-        # Initialize batch generator
-        val_loss_current = np.Inf # initialize best loss at infinity
-        steps_per_epoch = int(np.floor(X_train.shape[0] / batch_size)) # number of iterations per epoch
+        # Do an initial valuation and save the loss
+        val_loss_current = self.evaluate(val_generator, Tmax, 'gaussian')
+
+        # steps_per_epoch = int(np.floor(X_train.shape[0] / batch_size))
+        steps_per_epoch = train_generator.__len__() # number of iterations per epoch
         iterations = steps_per_epoch * epochs
         # batch = self.batch_generator(X_train, y_train, X_val, y_val, batch_size)
 
         # Training loop
         for epoch in range(start, epochs):
             print(f'Epoch {epoch}')
-            train_generator = self.batch_generator(X_train, y_train, batch_size, shuffle = True)
+            # train_generator = self.batch_generator(X_train, y_train, batch_size, shuffle = True)
             # val_generator = self.batch_generator(X_val, y_val, shuffle = False)
-            for step in range(steps_per_epoch):
+            for step in range(steps_per_epoch//2):
                 # (X_batch, y_batch), (X_val_batch, y_val_batch) = next(batch)
-                (train_batch_x, train_batch_y) = next(train_generator)
-                print(train_batch_x.shape)
+                train_batch_x, train_batch_y = train_generator.__getitem__(step)
+                # (train_batch_x, train_batch_y) = next(train_generator)
                 # Train AE and SOM jointly
                 if step % update_interval == 0:
                     print(f'Updating join AE and SOM')
@@ -724,11 +779,13 @@ class LstmDESOM(DESOM):
                     w_batch = self.neighborhood_function(self.map_dist(y_pred), T, neighborhood)
                     
                     # Train on batch
-                    loss = self.model.train_on_batch(train_batch_x, [train_batch_x, w_batch])
+                    loss = self.model.train_on_batch(train_batch_x, [train_batch_y, w_batch])
 
+                    # Clear predictions?
+                    del(_, d, y_pred)
                 # Train only AE
                 else:
-                    loss = self.model.train_on_batch(train_batch_x, [train_batch_x, np.zeros((train_batch_x.shape[0], self.n_prototypes))])
+                    loss = self.model.train_on_batch(train_batch_x, [train_batch_y, np.zeros((train_batch_x.shape[0], self.n_prototypes))])
 
             # Evaluate and log monitored metrics
 
@@ -747,49 +804,44 @@ class LstmDESOM(DESOM):
             reshaped_prototypes = self.prototypes.reshape(self.prototypes.shape[0], -1)
             # d_original = np.square((np.expand_dims(encoded_hidden.reshape(encoded_hidden.shape[0], -1), axis=1)
             #                         - reshaped_prototypes)).sum(axis=2)
+            
+            val_loss_epoch = self.evaluate(val_generator, T, 'gaussian')
 
-            _, encoded_hidden, _ = self.encode(X_val)
-            _, d_val = self.model.predict(X_val, verbose = 0)
-            y_val_pred = d_val.argmin(axis=1)
-            w_val_batch = self.neighborhood_function(self.map_dist(y_val_pred), T, neighborhood)
-            val_loss = self.model.test_on_batch(X_val, [X_val, w_val_batch])
-            d_original_val = np.square((np.expand_dims(encoded_hidden.reshape(encoded_hidden.shape[0], -1), axis=1)
-                                        - reshaped_prototypes)).sum(axis=2)
-
-            batch_summary = {
-                'map_size': self.map_size,
-                'iteration': ite,
-                'T': T,
-                'loss': loss,
-                'val_loss': val_loss if X_val is not None else None,
-                # 'd_latent': np.sqrt(d),
-                # 'd_original': np.sqrt(d_original),
-                'd_latent_val': np.sqrt(d_val) if X_val is not None else None,
-                'd_original_val': np.sqrt(d_original_val) if X_val is not None else None,
-                'prototypes': self.prototypes, #decoded_prototypes,
-                'latent_prototypes': self.prototypes,
-                'X': train_batch_x.reshape(train_batch_x.shape[0], -1),
-                'X_val': X_val.reshape(X_val.shape[0], -1) if X_val is not None else None,
-                'Z': self.encode(train_batch_x),
-                'Z_val': self.encode(X_val) if X_val is not None else None,
-                'y_true': train_batch_y,
-                'y_pred': y_pred,
-                'y_val_true': y_val,
-                'y_val_pred': y_val_pred if X_val is not None else None,
-            }
+            # batch_summary = {
+            #     'map_size': self.map_size,
+            #     'iteration': ite,
+            #     'T': T,
+            #     'loss': loss,
+            #     'val_loss': val_loss if X_val is not None else None,
+            #     # 'd_latent': np.sqrt(d),
+            #     # 'd_original': np.sqrt(d_original),
+            #     'd_latent_val': np.sqrt(d_val) if X_val is not None else None,
+            #     'd_original_val': np.sqrt(d_original_val) if X_val is not None else None,
+            #     'prototypes': self.prototypes, #decoded_prototypes,
+            #     'latent_prototypes': self.prototypes,
+            #     'X': train_batch_x.reshape(train_batch_x.shape[0], -1),
+            #     'X_val': X_val.reshape(X_val.shape[0], -1) if X_val is not None else None,
+            #     'Z': self.encode(train_batch_x),
+            #     'Z_val': self.encode(X_val) if X_val is not None else None,
+            #     'y_true': train_batch_y,
+            #     'y_pred': y_pred,
+            #     'y_val_true': y_val,
+            #     'y_val_pred': y_val_pred if X_val is not None else None,
+            # }
 
             # perflogger.log(batch_summary, verbose=verbose)
             
             # Save intermediate model if metric improves
-            if np.array(val_loss).mean() < val_loss_current:
-                val_loss_current = np.array(val_loss).mean()
+            if val_loss_epoch < val_loss_current:
+                val_loss_current = val_loss_epoch
                 print(val_loss_current)
-                self.model.save_weights(save_dir + '/LstmDESOM_model_' + str(epoch) + '.h5')
-                print('Saved model to:', save_dir + '/LstmDESOM_model_' + str(epoch) + '.h5')
-        
+                self.save_model(save_dir, epoch, '_best.keras')
+            else:
+                self.save_model(save_dir, epoch, '.keras')
         # Save the final model
-        print('Saving final model to:', save_dir + '/LstmDESOM_model_final.h5')
-        self.model.save_weights(save_dir + '/LstmDESOM_model_final.h5')
+
+        print('Saving final model to:./LstmDESOM_model_final.keras')
+        self.save_model(save_dir, epoch, '_final.keras')
 
         # Evaluate model on entire dataset
         print('Evaluate model on training and/or validation datasets')
@@ -807,23 +859,23 @@ class LstmDESOM(DESOM):
         val_loss = self.model.test_on_batch(X_val, [X_val, w_val_batch])
         d_original_val = np.square((np.expand_dims(encoded_hidden.reshape(encoded_hidden.shape[0], -1), axis=1)
                                     - reshaped_prototypes)).sum(axis=2)
-        final_summary = {
-            'map_size': self.map_size,
-            'iteration': iterations,
-            'd_latent': np.sqrt(d),
-            # 'd_original': np.sqrt(d_original),
-            'd_latent_val': np.sqrt(d_val) if X_val is not None else None,
-            'd_original_val': np.sqrt(d_original_val) if X_val is not None else None,
-            'prototypes': self.prototypes,
-            'latent_prototypes': self.prototypes,
-            'X': X_train.reshape(X_train.shape[0], -1),
-            'X_val': X_val.reshape(X_val.shape[0], -1) if X_val is not None else None,
-            'Z': self.encode(X_train),
-            'Z_val': self.encode(X_val) if X_val is not None else None,
-            'y_true': y_train,
-            'y_pred': y_pred,
-            'y_val_true': y_val,
-            'y_val_pred': y_val_pred if X_val is not None else None,
-        }
+        # final_summary = {
+        #     'map_size': self.map_size,
+        #     'iteration': iterations,
+        #     'd_latent': np.sqrt(d),
+        #     # 'd_original': np.sqrt(d_original),
+        #     'd_latent_val': np.sqrt(d_val) if X_val is not None else None,
+        #     'd_original_val': np.sqrt(d_original_val) if X_val is not None else None,
+        #     'prototypes': self.prototypes,
+        #     'latent_prototypes': self.prototypes,
+        #     'X': X_train.reshape(X_train.shape[0], -1),
+        #     'X_val': X_val.reshape(X_val.shape[0], -1) if X_val is not None else None,
+        #     'Z': self.encode(X_train),
+        #     'Z_val': self.encode(X_val) if X_val is not None else None,
+        #     'y_true': y_train,
+        #     'y_pred': y_pred,
+        #     'y_val_true': y_val,
+        #     'y_val_pred': y_val_pred if X_val is not None else None,
+        # }
         # perflogger.evaluate(final_summary, verbose=verbose)
         # perflogger.close()
